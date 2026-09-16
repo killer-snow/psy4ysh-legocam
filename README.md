@@ -6,6 +6,10 @@
 [![Sensor](https://img.shields.io/badge/Sensor-OV2640%20UXGA-green.svg)](https://github.com/espressif/esp32-camera)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+<p align="center">
+  <img src="assets/feature.jpg" alt="Psy4ysh LegoCam Hardware Prototype" width="720">
+</p>
+
 A compact, standalone, retro-style digital camera built with an **AI-Thinker ESP32-CAM**, a **1.3" 240x240 IPS ST7789 display**, and a tactile shutter push-button. 
 
 Designed for custom enclosures (like a 3D-printed or Lego camera chassis), it features a real-time viewfinder on the physical screen and a companion **Wi-Fi Access Point** that automatically beams full-resolution **UXGA (1600x1200)** photos directly to your smartphone or laptop browser — with zero cloud, zero apps, and zero internet connection required.
@@ -17,7 +21,7 @@ Designed for custom enclosures (like a 3D-printed or Lego camera chassis), it fe
 - **Live IPS Viewfinder**: Real-time camera feed rendered onto a 1.3" 240x240 ST7789 IPS display with a composition **Rule-of-Thirds grid** and blinking recording indicator.
 - **Dual-Resolution Architecture**:
   - Standby Viewfinder: Smooth **QVGA (320x240)** stream centered on the square screen for maximum frame rate.
-  - Shutter Trigger: Dynamically switches the OV2640 ISP to **UXGA (1600x1200)** high quality (`jpeg_quality = 10`) for maximum resolution.
+  - Shutter Trigger: Dynamically switches the OV2640 ISP to **UXGA (1600x1200)** high quality (`jpeg_quality = 4`) for maximum resolution.
 - **Instant Photo Review**: Displays the captured photo on the physical LCD screen for 3 seconds before returning to the live viewfinder.
 - **Wi-Fi Companion Studio (SoftAP)**:
   - Creates a local Wi-Fi hotspot (`DigiCam-AP`).
@@ -36,7 +40,19 @@ Designed for custom enclosures (like a 3D-printed or Lego camera chassis), it fe
 
 ## 📐 Circuit & Wiring Pinout
 
-### 1. ST7789 7-Pin SPI IPS Display (240x240)
+<p align="center">
+  <img src="assets/circuit.png" alt="Complete Circuit Schematic" width="750">
+</p>
+
+### 1. Power Supply & Battery Management Circuit
+| Module / Part | Connections | Purpose |
+| :--- | :--- | :--- |
+| **3.7V LiPo Battery (110mAh)** | `B+` / `B-` -> TP4056 `B+` / `B-` | Power source (6SP 061225) |
+| **TP4056 USB-C Charger** | `OUT-` -> Common GND<br>`OUT+` -> Power Switch | Battery charging & over-discharge protection |
+| **Slide Switch (SPDT)** | Between TP4056 `OUT+` and Boost Converter `IN+` | Hardware power ON/OFF switch |
+| **Step-Up Boost Converter** | `IN+` -> Switch<br>`IN-` -> GND<br>`OUT+` -> ESP32-CAM `5V`<br>`OUT-` -> GND | Boosts 3.7V battery voltage to stable **5.0V** to eliminate brownouts |
+
+### 2. ST7789 7-Pin SPI IPS Display (240x240)
 | ST7789 Pin | ESP32-CAM Pin | Description |
 | :--- | :--- | :--- |
 | **VCC** | **3V3** | 3.3V Power |
@@ -48,7 +64,7 @@ Designed for custom enclosures (like a 3D-printed or Lego camera chassis), it fe
 | **BLK / LED** | **3V3** | Backlight (tie to 3V3 for full brightness) |
 | **CS** | *N/A* | 7-pin modules have CS internally tied to GND |
 
-### 2. Shutter Button & Flash
+### 3. Shutter Button & Flash
 | Component | ESP32-CAM Pin | Wiring Details |
 | :--- | :--- | :--- |
 | **Shutter Button** | **GPIO 13** | Momentary push-button connected between **GPIO 13** and **GND** (uses internal `INPUT_PULLUP`). |
@@ -148,6 +164,9 @@ If your photos look blurry or soft out of the box, perform these two physical ad
 
 ```text
 ESP32_DigiCam/
+├── assets/
+│   ├── feature.jpg         # Prototype hardware hero photo
+│   └── circuit.png         # Full Cirkit Designer wiring schematic
 ├── ESP32_DigiCam.ino       # Core firmware: camera driver, ST7789 engine, HTTP server & state machine
 ├── camera_pins.h           # Hardware pin definitions for AI-Thinker ESP32-CAM
 ├── web_page.h              # Embedded companion web application (PROGMEM HTML/CSS/JS)
