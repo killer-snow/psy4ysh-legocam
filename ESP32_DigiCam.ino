@@ -23,6 +23,7 @@
 
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <DNSServer.h>
 #include "esp_http_server.h"
 #include <TFT_eSPI.h>
 #include <TJpg_Decoder.h>
@@ -33,6 +34,10 @@
 // Wi-Fi Access Point Credentials
 const char* AP_SSID = "DigiCam-AP";
 const char* AP_PASS = "123456789";
+
+// Captive Portal Offline DNS Server (Port 53)
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
 
 // Display and Web Server instances
 TFT_eSPI tft = TFT_eSPI();
@@ -227,11 +232,22 @@ static esp_err_t status_handler(httpd_req_t *req) {
   return httpd_resp_send(req, json, strlen(json));
 }
 
+// Captive Portal 404 Redirect: Intercepts Android / Apple connectivity checks and unknown URLs,
+// redirecting them instantly to http://192.168.4.1/
+static esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t error) {
+  httpd_resp_set_status(req, "302 Found");
+  httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+  httpd_resp_send(req, NULL, 0);
+  return ESP_OK;
+}
+
 // Start HTTP Server
 void startWebServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.ctrl_port = 32768;
+  config.lru_purge_enable = true; // Auto-purge oldest sockets when limit is reached (prevents socket exhaustion)
+  config.max_open_sockets = 7;    // Supported on ESP32 with PSRAM
 
   httpd_uri_t index_uri = {
     .uri       = "/",
@@ -258,6 +274,7 @@ void startWebServer() {
     httpd_register_uri_handler(camera_httpd, &index_uri);
     httpd_register_uri_handler(camera_httpd, &photo_uri);
     httpd_register_uri_handler(camera_httpd, &status_uri);
+    httpd_register_err_handler(camera_httpd, HTTPD_404_NOT_FOUND, http_404_error_handler);
   }
 }
 
@@ -278,7 +295,7 @@ void setup() {
   // Initialize ST7789 Display
   Serial.println("[1/4] Initializing ST7789 Screen...");
   tft.init();
-  tft.setRotation(2);      // 240x240 orientation
+  tft.setRotation(0);      // 240x240 orientation
   tft.invertDisplay(true); // Required for ST7789 IPS accurate colors
   tft.fillScreen(TFT_BLACK);
 
@@ -337,13 +354,17 @@ void setup() {
   Serial.println("       Camera tuned successfully.");
 
   // Setup Wi-Fi SoftAP
-  Serial.println("[3/4] Starting Wi-Fi Access Point...");
+  Serial.println("[3/4] Starting Wi-Fi Access Point & Offline DNS...");
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.softAP(AP_SSID, AP_PASS, 6); // Channel 6 avoids default Channel 1 crowding in public/college venues
   WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_19_5dBm); // Maximum RF transmit power (19.5 dBm) for outdoor range
   Serial.printf("       SSID: %s\n", AP_SSID);
   Serial.printf("       IP:   http://%s/\n", WiFi.softAPIP().toString().c_str());
+
+  // Start Offline DNS Server for Captive Portal (instant resolution in forests/mountains/campuses)
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+  Serial.println("       Offline DNS Server active (resolves all queries to 192.168.4.1).");
 
   // Start HTTP Server
   Serial.println("[4/4] Starting Web Server...");
@@ -359,6 +380,8 @@ void setup() {
 // MAIN LOOP
 // =========================================================================
 void loop() {
+  dnsServer.processNextRequest();
+
   // 1. Check for Shutter Trigger on GPIO 13
   if (digitalRead(SHUTTER_PIN) == LOW) {
     delay(40); // Debounce
@@ -388,6 +411,7 @@ void loop() {
       esp_camera_fb_return(fb);
 
       drawModernViewfinder();
+      delay(8); // Yield breathing room for Wi-Fi & WebServer packet processing
     } else {
       static unsigned long lastFailPrint = 0;
       if (millis() - lastFailPrint > 2500) {
