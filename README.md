@@ -75,6 +75,23 @@ Designed for custom enclosures (like a 3D-printed or Lego camera chassis), it fe
 
 ---
 
+## 🖨️ 3D Printable Camera Enclosure (`cam_body/`)
+
+<p align="center">
+  <img src="cam_body/espcam%20shoot.PNG" alt="3D Printable Camera Enclosure Render" width="700">
+</p>
+
+The repository includes ready-to-print **STL 3D models** located in the [`cam_body/`](cam_body/) directory, specifically tailored to house the ESP32-CAM, ST7789 display, TP4056 USB-C charging module, battery, boost converter, and switches:
+
+| File | Description |
+| :--- | :--- |
+| [`espcam bod.stl`](cam_body/espcam%20bod.stl) | Main chassis body with cutouts for ST7789 screen, lens, and side USB-C charging port |
+| [`espcam  cover.stl`](cam_body/espcam%20%20cover.stl) | Protective enclosure cover plate |
+| [`cam button.stl`](cam_body/cam%20button.stl) | Ergonomic shutter button cap |
+| [`switch plate.stl`](cam_body/switch%20plate.stl) | Mounting plate for the slide power switch and tactile button |
+
+---
+
 ## 🛠️ Software Setup & Installation
 
 ### 1. Required Arduino Libraries
@@ -167,6 +184,12 @@ ESP32_DigiCam/
 ├── assets/
 │   ├── feature.jpg         # Prototype hardware hero photo
 │   └── circuit.png         # Full Cirkit Designer wiring schematic
+├── cam_body/               # 3D printable camera enclosure (.stl models & render)
+│   ├── cam button.stl      # Shutter button cap
+│   ├── espcam  cover.stl   # Enclosure cover plate
+│   ├── espcam bod.stl      # Main camera body chassis
+│   ├── espcam shoot.PNG    # 3D enclosure preview render
+│   └── switch plate.stl    # Power switch plate
 ├── ESP32_DigiCam.ino       # Core firmware: camera driver, ST7789 engine, HTTP server & state machine
 ├── camera_pins.h           # Hardware pin definitions for AI-Thinker ESP32-CAM
 ├── web_page.h              # Embedded companion web application (PROGMEM HTML/CSS/JS)
