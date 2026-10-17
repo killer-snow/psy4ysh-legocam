@@ -1,32 +1,36 @@
 /*
  * =========================================================================
- * ESP32-CAM DIY DigiCam
+ * ESP32-CAM DIY DigiCam — Production Engine & Hardened Network Stack
  * =========================================================================
  * Hardware:
- *   - AI-Thinker ESP32-CAM (OV2640 + PSRAM)
+ *   - AI-Thinker ESP32-CAM (OV2640 + 4MB/8MB PSRAM)
  *   - ST7789 1.3" 240x240 7-Pin IPS Display
  *       3V3 + BLK -> 3V3
  *       GND       -> GND
- *       SCL       -> GPIO 14
- *       SDA       -> GPIO 15
+ *       SCL       -> GPIO 14 (HSPI SCLK)
+ *       SDA       -> GPIO 15 (HSPI MOSI)
  *       RESET     -> GPIO 2
  *       DC        -> GPIO 12
  *   - Physical Shutter Button -> GPIO 13 (to GND with INPUT_PULLUP)
  *
- * Web Functionality:
- *   - Standalone Wi-Fi Access Point ("DigiCam-AP" / "123456789")
- *   - Webpage at http://192.168.4.1/
- *   - Pressing the physical shutter button snaps a high-res photo,
- *     which automatically appears on the webpage with a DOWNLOAD button.
+ * Concurrency & Memory Architecture:
+ *   - Pre-allocated PSRAM Triple-Buffer Pool (3 x 384 KB fixed slots)
+ *   - Reference-counted reader lock prevents use-after-free and write collisions
+ *   - Fully non-blocking review state machine (zero DNS starvation)
+ *   - Fast shutter re-triggering with zero lag
+ *   - Explicit SoftAP static IP configuration & RFC 9112 compliant streaming
  * =========================================================================
  */
 
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include "esp_http_server.h"
 #include <TFT_eSPI.h>
 #include <TJpg_Decoder.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "camera_pins.h"
 #include "web_page.h"
@@ -43,32 +47,53 @@ const byte DNS_PORT = 53;
 TFT_eSPI tft = TFT_eSPI();
 httpd_handle_t camera_httpd = NULL;
 
-// Photo Storage in PSRAM
-uint8_t* captured_photo_buf = NULL;
-size_t captured_photo_len = 0;
-volatile uint32_t photo_count = 0;
-volatile bool is_capturing = false;
+// =========================================================================
+// THREAD-SAFE PSRAM TRIPLE-BUFFER POOL
+// =========================================================================
+#define NUM_PHOTO_SLOTS 3
+#define MAX_SLOT_SIZE (384 * 1024) // 384 KB per slot in PSRAM (ample for UXGA Q=10)
 
-// JPEG decoder callback for ST7789
+typedef struct {
+  uint8_t* buf;
+  size_t len;
+  uint32_t id;
+  volatile int readers; // Active HTTP streaming clients
+} PhotoSlot;
+
+static PhotoSlot photo_slots[NUM_PHOTO_SLOTS];
+static volatile int active_slot_idx = -1;
+static volatile uint32_t global_photo_id = 0;
+static SemaphoreHandle_t photo_mutex = NULL;
+
+// Camera State Machine
+enum CameraState {
+  STATE_VIEWFINDER,
+  STATE_REVIEW_DISPLAY
+};
+static volatile CameraState camera_state = STATE_VIEWFINDER;
+static unsigned long review_start_time = 0;
+
+// JPEG decoder callback with screen boundary guards
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-  if (y >= tft.height()) return false;
+  if (y >= tft.height()) return false; // Below screen: no later block can be visible
+  if (x >= tft.width() || x + w <= 0 || y + h <= 0) return true; // Skip off-screen block, continue decoding
   tft.pushImage(x, y, w, h, bitmap);
   return true;
 }
 
-// Viewfinder Overlay: Rules of Thirds Grid + Blinking REC Indicator
+// Viewfinder Overlay: Rule-of-Thirds Grid + Blinking REC Indicator
 void drawModernViewfinder() {
   uint16_t uiColor = TFT_GREEN;
   tft.setTextColor(uiColor, TFT_BLACK);
   tft.setTextSize(1);
 
-  // Garis Bantu Rules of Thirds / Rules of Thirds Grid
+  // Rule-of-Thirds Grid
   tft.drawLine(tft.width() / 3, 0, tft.width() / 3, tft.height(), TFT_DARKGREEN);
   tft.drawLine((tft.width() / 3) * 2, 0, (tft.width() / 3) * 2, tft.height(), TFT_DARKGREEN);
   tft.drawLine(0, tft.height() / 3, tft.width(), tft.height() / 3, TFT_DARKGREEN);
   tft.drawLine(0, (tft.height() / 3) * 2, tft.width(), (tft.height() / 3) * 2, TFT_DARKGREEN);
 
-  // Indikator REC Berkedip / Blinking REC Indicator
+  // Blinking REC Indicator
   int offset = 12;
   if (millis() % 1000 < 500) {
     tft.fillCircle(tft.width() - offset - 40, tft.height() - offset - 3, 3, TFT_RED);
@@ -96,7 +121,7 @@ void tuneSensorQuality() {
   // Auto Exposure
   s->set_exposure_ctrl(s, 1);    // Enable auto exposure
   s->set_aec2(s, 1);             // Enhanced DSP AEC algorithm
-  s->set_ae_level(s, 1);         // Balanced exposure compensation (avoids blowing out highlights)
+  s->set_ae_level(s, 1);         // Balanced exposure compensation
 
   // Low Light Auto Gain (Capped to reduce grainy multicolored chromatic noise)
   s->set_gain_ctrl(s, 1);        // Enable auto gain
@@ -109,78 +134,115 @@ void tuneSensorQuality() {
   s->set_raw_gma(s, 1);          // Gamma curve correction
 }
 
+// Select an available standby buffer slot from the PSRAM pool safely
+int getAvailableSlot() {
+  if (photo_mutex == NULL) return -1;
+  xSemaphoreTake(photo_mutex, portMAX_DELAY);
 
-// Capture Sequence: Switches to UXGA, grabs photo into PSRAM, resets to QVGA
-void captureHighResPhoto() {
-  is_capturing = true;
-  Serial.println("[SHUTTER] Switching sensor to UXGA (1600x1200)...");
-
-  sensor_t *s = esp_camera_sensor_get();
-  s->set_framesize(s, FRAMESIZE_UXGA);
-  s->set_quality(s, 10); // Optimized for ultra-fast Wi-Fi transfer with razor-sharp UXGA detail
-  delay(120);
-
-  // Discard 2 frames so sensor auto-exposure adapts to UXGA
-  for (int i = 0; i < 2; i++) {
-    camera_fb_t *junk = esp_camera_fb_get();
-    if (junk) esp_camera_fb_return(junk);
-    delay(40);
+  int chosen = -1;
+  // Pick a standby slot that is NOT currently active and has NO active readers
+  for (int i = 0; i < NUM_PHOTO_SLOTS; i++) {
+    if (i != active_slot_idx && photo_slots[i].readers == 0) {
+      chosen = i;
+      break;
+    }
   }
 
-  // Capture High-Res Picture
-  camera_fb_t *pic = esp_camera_fb_get();
-  if (pic) {
-    if (captured_photo_buf != NULL) {
-      free(captured_photo_buf);
-      captured_photo_buf = NULL;
-    }
+  xSemaphoreGive(photo_mutex);
+  return chosen;
+}
 
-    captured_photo_len = pic->len;
-    captured_photo_buf = (uint8_t*)ps_malloc(captured_photo_len);
-    if (!captured_photo_buf) {
-      captured_photo_buf = (uint8_t*)malloc(captured_photo_len);
-    }
+// Capture Sequence: Switches to UXGA, grabs photo into pre-allocated PSRAM, displays review
+void captureHighResPhoto() {
+  int target_slot = getAvailableSlot();
+  if (target_slot == -1) {
+    Serial.println("[SHUTTER] All slots busy streaming to network; capture skipped.");
+    return;
+  }
 
-    if (captured_photo_buf) {
-      memcpy(captured_photo_buf, pic->buf, captured_photo_len);
-      photo_count++; // Signal web page that a new photo is ready
-      Serial.printf("[SHUTTER] SUCCESS! UXGA photo captured: %u bytes (%u KB)\n",
-                    (unsigned int)captured_photo_len, (unsigned int)(captured_photo_len / 1024));
+  Serial.printf("[SHUTTER] Capturing into PSRAM slot %d...\n", target_slot);
 
-      // Display the captured photo on the ST7789 screen for 3 seconds
-      Serial.println("[VIEWFINDER] Showing captured photo on screen for 3 seconds...");
-      TJpgDec.setJpgScale(4); // 1600x1200 / 4 = 400x300 (centered onto 240x240 screen)
-      TJpgDec.drawJpg(-80, -30, captured_photo_buf, captured_photo_len);
-      TJpgDec.setJpgScale(1); // Reset scale back to 1 for live viewfinder
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
 
-      // Hold image for 3 seconds while keeping FreeRTOS responsive
-      for (int t = 0; t < 30; t++) {
-        delay(100);
-        yield();
+  s->set_framesize(s, FRAMESIZE_UXGA);
+  s->set_quality(s, 10);
+  delay(100);
+
+  // Grab photo with resolution validation to reject stale QVGA frames
+  camera_fb_t *pic = NULL;
+  for (int attempt = 0; attempt < 4; attempt++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) {
+      if (fb->width == 1600 && fb->height == 1200) {
+        pic = fb;
+        break;
       }
-    } else {
-      Serial.println("[SHUTTER] ERROR: Failed to allocate PSRAM memory for photo!");
+      // Frame was still QVGA or corrupted, discard and retry
+      esp_camera_fb_return(fb);
     }
+    delay(30);
+  }
+
+  // Validate frame size: reject oversized frames cleanly instead of truncating JPEG
+  if (pic) {
+    if (pic->len > MAX_SLOT_SIZE) {
+      Serial.printf("[SHUTTER] ERROR: Frame %u bytes exceeds MAX_SLOT_SIZE (%u bytes)!\n",
+                    (unsigned int)pic->len, (unsigned int)MAX_SLOT_SIZE);
+      esp_camera_fb_return(pic);
+      pic = NULL;
+    }
+  }
+
+  if (pic) {
+    size_t copy_len = pic->len;
+
+    // Copy frame directly into pre-allocated PSRAM buffer
+    memcpy(photo_slots[target_slot].buf, pic->buf, copy_len);
+    photo_slots[target_slot].len = copy_len;
+
+    // Atomically publish new active photo
+    xSemaphoreTake(photo_mutex, portMAX_DELAY);
+    global_photo_id++;
+    photo_slots[target_slot].id = global_photo_id;
+    active_slot_idx = target_slot;
+    xSemaphoreGive(photo_mutex);
+
+    Serial.printf("[SHUTTER] SUCCESS! UXGA photo #%u captured: %u bytes (%u KB)\n",
+                  (unsigned int)global_photo_id,
+                  (unsigned int)copy_len,
+                  (unsigned int)(copy_len / 1024));
+
+    // Render scaled review onto ST7789 display (400x300 centered on 240x240)
+    TJpgDec.setJpgScale(4);
+    TJpgDec.drawJpg(-80, -30, photo_slots[target_slot].buf, photo_slots[target_slot].len);
+    TJpgDec.setJpgScale(1);
 
     esp_camera_fb_return(pic);
   } else {
-    Serial.println("[SHUTTER] ERROR: esp_camera_fb_get() returned NULL!");
+    Serial.println("[SHUTTER] ERROR: Failed to capture valid UXGA frame!");
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.drawString("CAPTURE FAILED", 35, 110);
   }
 
   // Restore sensor back to QVGA for live viewfinder
   s->set_framesize(s, FRAMESIZE_QVGA);
   s->set_quality(s, 14);
-  delay(60);
+  delay(50);
 
   // Flush 1 frame so sensor cleanly transitions back to live feed
-  camera_fb_t *junk2 = esp_camera_fb_get();
-  if (junk2) esp_camera_fb_return(junk2);
+  camera_fb_t *junk = esp_camera_fb_get();
+  if (junk) esp_camera_fb_return(junk);
 
-  is_capturing = false;
+  // Transition to review display state (non-blocking)
+  camera_state = STATE_REVIEW_DISPLAY;
+  review_start_time = millis();
 }
 
 // =========================================================================
-// HTTP SERVER HANDLERS
+// HTTP SERVER HANDLERS (THREAD-SAFE & RFC 9112 COMPLIANT)
 // =========================================================================
 
 // Serves the Web Photo Gallery Page
@@ -190,41 +252,72 @@ static esp_err_t index_handler(httpd_req_t *req) {
   return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
 }
 
-// Serves the Latest Captured Photo for Download (Fast 4KB chunked streaming)
+// Serves the Latest Captured Photo (RFC 9112 compliant full-body send)
 static esp_err_t photo_handler(httpd_req_t *req) {
-  if (captured_photo_buf == NULL || captured_photo_len == 0) {
+  int slot_idx = -1;
+  uint8_t *send_buf = NULL;
+  size_t send_len = 0;
+  uint32_t served_id = 0;
+
+  // Safely acquire reader lock on the active slot
+  xSemaphoreTake(photo_mutex, portMAX_DELAY);
+  if (active_slot_idx >= 0 && active_slot_idx < NUM_PHOTO_SLOTS) {
+    slot_idx = active_slot_idx;
+    send_buf = photo_slots[slot_idx].buf;
+    send_len = photo_slots[slot_idx].len;
+    served_id = photo_slots[slot_idx].id;
+    photo_slots[slot_idx].readers++; // Increment reader count
+  }
+  xSemaphoreGive(photo_mutex);
+
+  if (slot_idx == -1 || send_buf == NULL || send_len == 0) {
     httpd_resp_send_404(req);
     return ESP_FAIL;
   }
 
+  char id_str[16];
+  snprintf(id_str, sizeof(id_str), "%u", (unsigned int)served_id);
+
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=digicam.jpg");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Access-Control-Expose-Headers", "X-Photo-Id");
+  httpd_resp_set_hdr(req, "X-Photo-Id", id_str);
   httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
 
-  // Stream in 4096-byte chunks (significantly cuts down TCP packet round trips)
-  size_t remaining = captured_photo_len;
-  const char *p = (const char *)captured_photo_buf;
-  while (remaining > 0) {
-    size_t chunk = remaining > 4096 ? 4096 : remaining;
-    esp_err_t res = httpd_resp_send_chunk(req, p, chunk);
-    if (res != ESP_OK) {
-      Serial.printf("[HTTP] Error sending photo chunk: %d\n", res);
-      return res;
-    }
-    p += chunk;
-    remaining -= chunk;
+  // httpd_resp_send automatically sets Content-Length and sends entire body cleanly
+  esp_err_t res = httpd_resp_send(req, (const char *)send_buf, send_len);
+  if (res != ESP_OK) {
+    Serial.printf("[HTTP] Error sending photo: %d\n", res);
   }
-  httpd_resp_send_chunk(req, NULL, 0); // End transmission
-  return ESP_OK;
+
+  // Always release the reader count!
+  xSemaphoreTake(photo_mutex, portMAX_DELAY);
+  photo_slots[slot_idx].readers--;
+  if (photo_slots[slot_idx].readers < 0) {
+    photo_slots[slot_idx].readers = 0;
+  }
+  xSemaphoreGive(photo_mutex);
+
+  return res;
 }
 
 // Status Polling Endpoint (/status) for Web Auto-Refresh
 static esp_err_t status_handler(httpd_req_t *req) {
+  uint32_t current_id = 0;
+  size_t current_size = 0;
+
+  xSemaphoreTake(photo_mutex, portMAX_DELAY);
+  if (active_slot_idx >= 0 && active_slot_idx < NUM_PHOTO_SLOTS) {
+    current_id = photo_slots[active_slot_idx].id;
+    current_size = photo_slots[active_slot_idx].len;
+  }
+  xSemaphoreGive(photo_mutex);
+
   char json[128];
   snprintf(json, sizeof(json), "{\"photoId\":%u,\"photoSize\":%u}",
-           (unsigned int)photo_count,
-           (unsigned int)captured_photo_len);
+           (unsigned int)current_id,
+           (unsigned int)current_size);
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -232,8 +325,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
   return httpd_resp_send(req, json, strlen(json));
 }
 
-// Captive Portal 404 Redirect: Intercepts Android / Apple connectivity checks and unknown URLs,
-// redirecting them instantly to http://192.168.4.1/
+// Captive Portal Redirect Handler (Intercepts connectivity checks)
 static esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t error) {
   httpd_resp_set_status(req, "302 Found");
   httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
@@ -241,13 +333,16 @@ static esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t error
   return ESP_OK;
 }
 
-// Start HTTP Server
+// Start HTTP Server with hardened socket stack configuration
 void startWebServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.ctrl_port = 32768;
-  config.lru_purge_enable = true; // Auto-purge oldest sockets when limit is reached (prevents socket exhaustion)
-  config.max_open_sockets = 7;    // Supported on ESP32 with PSRAM
+  config.lru_purge_enable = true;
+  config.max_open_sockets = 5;
+  config.stack_size = 8192;       // Double default stack size to prevent task overflow
+  config.send_wait_timeout = 10;  // 10s timeout prevents premature socket aborts
+  config.recv_wait_timeout = 10;
 
   httpd_uri_t index_uri = {
     .uri       = "/",
@@ -284,28 +379,51 @@ void startWebServer() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n==============================");
-  Serial.println("   ESP32-CAM DIGICAM START    ");
-  Serial.println("==============================");
+  Serial.println("\n============================================");
+  Serial.println("   ESP32-CAM DIGICAM (PRODUCTION ENGINE)    ");
+  Serial.println("============================================");
 
   pinMode(SHUTTER_PIN, INPUT_PULLUP);
   pinMode(FLASH_PIN, OUTPUT);
-  digitalWrite(FLASH_PIN, LOW); // Ensure flash LED is completely OFF
+  digitalWrite(FLASH_PIN, LOW); // Flash LED explicitly OFF
 
-  // Initialize ST7789 Display
-  Serial.println("[1/4] Initializing ST7789 Screen...");
+  // 1. Initialize ST7789 Display
+  Serial.println("[1/5] Initializing ST7789 Screen...");
   tft.init();
-  tft.setRotation(0);      // 240x240 orientation
-  tft.invertDisplay(true); // Required for ST7789 IPS accurate colors
+  tft.setRotation(0);
+  tft.invertDisplay(true);
   tft.fillScreen(TFT_BLACK);
+  tft.setViewport(0, 0, 240, 240); // Enable hardware scissoring/clipping
 
-  // Initialize JPEG Decoder
   TJpgDec.setCallback(tft_output);
-  TJpgDec.setSwapBytes(true); // Required for true color depth
+  TJpgDec.setSwapBytes(true);
   Serial.println("       Screen initialized successfully.");
 
-  // Initialize Camera
-  Serial.println("[2/4] Initializing Camera Sensor...");
+  // 2. Initialize Thread Safety Primitives & Pre-allocate PSRAM Pool
+  Serial.println("[2/5] Pre-allocating PSRAM Triple-Buffer Pool...");
+  photo_mutex = xSemaphoreCreateMutex();
+  if (photo_mutex == NULL) {
+    Serial.println("       CRITICAL: Failed to create photo mutex!");
+    tft.fillScreen(TFT_RED);
+    while (true) delay(1000);
+  }
+
+  for (int i = 0; i < NUM_PHOTO_SLOTS; i++) {
+    photo_slots[i].buf = (uint8_t*)ps_malloc(MAX_SLOT_SIZE);
+    if (!photo_slots[i].buf) {
+      Serial.printf("       CRITICAL: Failed to allocate PSRAM slot %d (%d KB)!\n", i, MAX_SLOT_SIZE / 1024);
+      tft.fillScreen(TFT_RED);
+      while (true) delay(1000);
+    } else {
+      Serial.printf("       Slot %d initialized (%d KB in PSRAM).\n", i, MAX_SLOT_SIZE / 1024);
+    }
+    photo_slots[i].len = 0;
+    photo_slots[i].id = 0;
+    photo_slots[i].readers = 0;
+  }
+
+  // 3. Initialize Camera Sensor
+  Serial.println("[3/5] Initializing Camera Sensor...");
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -327,7 +445,7 @@ void setup() {
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_UXGA; // Required: Allocates PSRAM buffer large enough for 1600x1200!
+  config.frame_size   = FRAMESIZE_UXGA; // Pre-allocates driver buffers for 1600x1200
   config.jpeg_quality = 10;
   config.fb_count     = 2;
   config.fb_location  = CAMERA_FB_IN_PSRAM;
@@ -343,81 +461,98 @@ void setup() {
   sensor_t *s = esp_camera_sensor_get();
   if (s != NULL) {
     Serial.printf("       Camera Sensor Detected! Model PID: 0x%04X\n", s->id.PID);
-    // Switch sensor to QVGA (320x240) for smooth, high-speed viewfinder
-    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_framesize(s, FRAMESIZE_QVGA); // Default to QVGA for live viewfinder
     s->set_quality(s, 14);
-  } else {
-    Serial.println("       WARNING: Sensor pointer is NULL!");
   }
 
   tuneSensorQuality();
   Serial.println("       Camera tuned successfully.");
 
-  // Setup Wi-Fi SoftAP
-  Serial.println("[3/4] Starting Wi-Fi Access Point & Offline DNS...");
+  // 4. Setup Wi-Fi SoftAP & Static IP Configuration
+  Serial.println("[4/5] Starting Wi-Fi Access Point & Offline DNS...");
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS, 6); // Channel 6 avoids default Channel 1 crowding in public/college venues
+
+  // Explicitly configure DHCP static IP parameters (avoids 0.0.0.0 gateway on mobile devices)
+  IPAddress apIP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(apIP, gateway, subnet);
+
+  WiFi.softAP(AP_SSID, AP_PASS, 6);
   WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm); // Maximum RF transmit power (19.5 dBm) for outdoor range
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   Serial.printf("       SSID: %s\n", AP_SSID);
   Serial.printf("       IP:   http://%s/\n", WiFi.softAPIP().toString().c_str());
 
-  // Start Offline DNS Server for Captive Portal (instant resolution in forests/mountains/campuses)
-  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-  Serial.println("       Offline DNS Server active (resolves all queries to 192.168.4.1).");
+  // Start mDNS responder (allows browsing to http://digicam.local/)
+  if (MDNS.begin("digicam")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("       mDNS active: http://digicam.local/");
+  }
 
-  // Start HTTP Server
-  Serial.println("[4/4] Starting Web Server...");
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+  Serial.println("       Offline DNS Server active.");
+
+  // 5. Start Web Server
+  Serial.println("[5/5] Starting Web Server...");
   startWebServer();
   Serial.println("       Web Server online.");
 
-  Serial.println("==============================");
-  Serial.println("   DIGICAM READY TO SHOOT!    ");
-  Serial.println("==============================");
+  Serial.println("============================================");
+  Serial.println("   DIGICAM READY (RESPONSIVE STATE MACHINE) ");
+  Serial.println("============================================");
 }
 
 // =========================================================================
-// MAIN LOOP
+// MAIN LOOP (NON-BLOCKING RESPONSIVE STATE MACHINE)
 // =========================================================================
 void loop() {
-  dnsServer.processNextRequest();
+  // Pump DNS server requests in burst to keep captive portal instant & alive
+  for (int i = 0; i < 3; i++) {
+    dnsServer.processNextRequest();
+  }
 
-  // 1. Check for Shutter Trigger on GPIO 13
+  // 1. Shutter Button Detection (Instant re-trigger supported even during review)
   if (digitalRead(SHUTTER_PIN) == LOW) {
-    delay(40); // Debounce
+    delay(30); // Debounce
     if (digitalRead(SHUTTER_PIN) == LOW) {
-      Serial.println("[SHUTTER] Button pressed! Capturing UXGA photo...");
+      Serial.println("[SHUTTER] Physical button pressed!");
       captureHighResPhoto();
-      Serial.printf("[SHUTTER] Photo saved! Size: %u KB. Ready on webpage.\n", (unsigned int)(captured_photo_len / 1024));
+
+      // Wait for physical button release while keeping DNS responsive
       while (digitalRead(SHUTTER_PIN) == LOW) {
+        dnsServer.processNextRequest();
         delay(10);
       }
       return;
     }
   }
 
-  // 2. Viewfinder Display: Render live frame to ST7789 screen
-  if (!is_capturing) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb) {
-      static bool firstSuccess = true;
-      if (firstSuccess) {
-        Serial.printf("[VIEWFINDER] Camera frames flowing! (Frame size: %u bytes)\n", (unsigned int)fb->len);
-        firstSuccess = false;
-      }
+  // 2. State Machine Handling
+  if (camera_state == STATE_REVIEW_DISPLAY) {
+    // Review timer: return to live viewfinder after 2.5 seconds
+    if (millis() - review_start_time >= 2500) {
+      camera_state = STATE_VIEWFINDER;
+    }
+    delay(10);
+    yield();
+    return;
+  }
 
+  // 3. Live Viewfinder State
+  if (camera_state == STATE_VIEWFINDER) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    dnsServer.processNextRequest();
+
+    if (fb) {
       // 320x240 QVGA image centered on 240x240 ST7789 screen
       TJpgDec.drawJpg(-40, 0, fb->buf, fb->len);
-      esp_camera_fb_return(fb);
+      dnsServer.processNextRequest();
 
+      esp_camera_fb_return(fb);
       drawModernViewfinder();
-      delay(8); // Yield breathing room for Wi-Fi & WebServer packet processing
+      delay(8); // Breathing room for Wi-Fi and WebServer packet processing
     } else {
-      static unsigned long lastFailPrint = 0;
-      if (millis() - lastFailPrint > 2500) {
-        Serial.println("[VIEWFINDER] Warning: Camera returned NULL frame buffer!");
-        lastFailPrint = millis();
-      }
       delay(10);
     }
   }

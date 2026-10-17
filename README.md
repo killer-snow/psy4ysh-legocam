@@ -21,12 +21,18 @@ Designed for custom enclosures (like a 3D-printed or Lego camera chassis), it fe
 - **Live IPS Viewfinder**: Real-time camera feed rendered onto a 1.3" 240x240 ST7789 IPS display with a composition **Rule-of-Thirds grid** and blinking recording indicator.
 - **Dual-Resolution Architecture**:
   - Standby Viewfinder: Smooth **QVGA (320x240)** stream centered on the square screen for maximum frame rate.
-  - Shutter Trigger: Dynamically switches the OV2640 ISP to **UXGA (1600x1200)** high quality (`jpeg_quality = 4`) for maximum resolution.
-- **Instant Photo Review**: Displays the captured photo on the physical LCD screen for 3 seconds before returning to the live viewfinder.
+  - Shutter Trigger: Dynamically switches the OV2640 ISP to **UXGA (1600x1200)** high quality (`jpeg_quality = 10`) for maximum resolution with frame validation.
+- **Thread-Safe Triple-Buffered PSRAM Pool**:
+  - Zero heap fragmentation: 3 pre-allocated fixed slots in PSRAM eliminate dynamic `ps_malloc` / `free` during runtime.
+  - Reference-counted reader lock prevents use-after-free and crash conditions between the FreeRTOS HTTP task and the shutter.
+  - Instant shutter re-triggering with zero shutter lag.
+- **Responsive Non-Blocking State Machine**:
+  - 2.5-second photo review on LCD with background DNS pump (eliminates captive portal timeouts).
+  - Tapping shutter during preview immediately snaps the next shot.
 - **Wi-Fi Companion Studio (SoftAP)**:
   - Creates a local Wi-Fi hotspot (`DigiCam-AP`).
-  - Webpage hosted directly at `http://192.168.4.1/`.
-  - **Auto-Sync & Download**: Snapping a photo with the physical button automatically transmits the photo to connected phones/PCs and triggers a direct download to your browser's Downloads folder.
+  - Webpage hosted directly at `http://192.168.4.1/` (or `http://digicam.local/`).
+  - **Auto-Fetch & Download**: Automatically fetches captured photos and provides direct JPG file download. A native "Share" button appears conditionally if the browser exposes the Web Share API in the active context.
 - **Hardware-Tuned ISP Pipeline**:
   - Hardware noise reduction filter (`denoise = 1`).
   - Edge sharpening (`sharpness = 2`).
@@ -51,6 +57,12 @@ Designed for custom enclosures (like a 3D-printed or Lego camera chassis), it fe
 | **TP4056 USB-C Charger** | `OUT-` -> Common GND<br>`OUT+` -> Power Switch | Battery charging & over-discharge protection |
 | **Slide Switch (SPDT)** | Between TP4056 `OUT+` and Boost Converter `IN+` | Hardware power ON/OFF switch |
 | **Step-Up Boost Converter** | `IN+` -> Switch<br>`IN-` -> GND<br>`OUT+` -> ESP32-CAM `5V`<br>`OUT-` -> GND | Boosts 3.7V battery voltage to stable **5.0V** to eliminate brownouts |
+
+> [!CAUTION]
+> **Battery Sizing & TP4056 Safety Warning:**
+> - Standard TP4056 modules come pre-configured with a 1.2kΩ resistor (`R3`/`Rprog`), which charges cells at **1,000mA (1A)**.
+> - Charging a 110mAh LiPo cell at 1,000mA is a **9C charge rate** and is an extreme **fire/thermal hazard**!
+> - **Recommendation**: Upgrade the battery to an **800mAh–1200mAh 1S LiPo** (e.g. 803040 or 103450 pouch cell) or an 18650 cell. This safely absorbs 1A charging and extends battery runtime from ~15 minutes to **2–3 hours** of continuous photography. If you must use a small 110mAh cell, you MUST swap `Rprog` on the TP4056 board to a **≥12kΩ** resistor (12kΩ ≈ 100mA, 20kΩ ≈ 60mA) to keep the charge rate at or below 1C.
 
 ### 2. ST7789 7-Pin SPI IPS Display (240x240)
 | ST7789 Pin | ESP32-CAM Pin | Description |
